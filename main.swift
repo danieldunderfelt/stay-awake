@@ -1,20 +1,27 @@
 import AppKit
 import IOKit
+import IOKit.ps
 
 // Toggles pmset's SleepDisabled flag, which (unlike caffeinate) also blocks
-// clamshell sleep with no external display. While the lid is closed and no
-// external display is connected it can also switch to Low Power Mode. Needs the
-// sudoers rule from install.sh.
+// clamshell sleep with no external display. It also sets the Energy Mode: High
+// Power with an external display on AC power, Low Power (optional) with the lid
+// closed on battery, and Automatic otherwise. Needs the sudoers rule from install.sh.
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let toggleItem = NSMenuItem(title: "Stay Awake (even with lid closed)", action: #selector(toggle), keyEquivalent: "")
-    private let lowPowerItem = NSMenuItem(title: "Low Power Mode While Lid Closed", action: #selector(toggleLowPower), keyEquivalent: "")
+    private let lowPowerItem = NSMenuItem(title: "Low Power Mode While Lid Closed on Battery", action: #selector(toggleLowPower), keyEquivalent: "")
     // Set while we've temporarily lifted SleepDisabled for a manual sleep.
     private let reenableKey = "reenableOnWake"
     private let lowPowerKey = "lowPowerWhenClosed"
-    // Power modes to restore on lid open, e.g. ["-b": "0", "-c": "2"]; present while Low Power is applied.
-    private let savedModesKey = "savedPowerModes"
     private var lidTimer: Timer?
+    // Last `pmset powermode` value we set, so we only call pmset when the target changes.
+    private var appliedMode: PowerMode?
+    // Pending switch to Low Power; cancelled if the target changes before it fires.
+    private var lowPowerDelay: Timer?
+
+    private enum PowerMode: String {
+        case automatic = "0", low = "1", high = "2"
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: [lowPowerKey: true])
@@ -41,7 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        restorePowerModes()
+        setPowerMode(.automatic)
     }
 
     func menuWillOpen(_ menu: NSMenu) { refresh() }
@@ -55,6 +62,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defer { IOObjectRelease(root) }
         let state = IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)
         return state?.takeRetainedValue() as? Bool ?? false
+    }
+
+    private var onACPower: Bool {
+        let info = IOPSCopyPowerSourcesInfo().takeRetainedValue()
+        return IOPSGetProvidingPowerSourceType(info).takeUnretainedValue() as String == kIOPMACPowerKey
     }
 
     private var externalDisplayConnected: Bool {
@@ -103,41 +115,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh()
     }
 
+    private var targetMode: PowerMode {
+        if externalDisplayConnected {
+            return onACPower ? .high : .automatic
+        }
+        if lidClosed && !onACPower && UserDefaults.standard.bool(forKey: lowPowerKey) {
+            return .low
+        }
+        return .automatic
+    }
+
+    // Low Power waits 10s (keeping the current mode) and only applies if it's still the target then.
     @objc private func updatePowerMode() {
-        let applied = UserDefaults.standard.dictionary(forKey: savedModesKey) != nil
-        let wantLowPower = lidClosed && !externalDisplayConnected && UserDefaults.standard.bool(forKey: lowPowerKey) && (applied || sleepDisabled)
-        if wantLowPower, !applied {
-            let modes = currentPowerModes()
-            if sudoPmset(["-a", "powermode", "1"]).ok {
-                UserDefaults.standard.set(modes, forKey: savedModesKey)
+        let target = targetMode
+        if target != .low {
+            lowPowerDelay?.invalidate()
+            lowPowerDelay = nil
+        }
+        guard target != appliedMode else { return }
+        if target != .low {
+            setPowerMode(target)
+        } else if lowPowerDelay == nil {
+            lowPowerDelay = Timer.scheduledTimer(withTimeInterval: 10, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                lowPowerDelay = nil
+                if targetMode == .low { setPowerMode(.low) }
             }
-        } else if !wantLowPower, applied {
-            restorePowerModes()
         }
     }
 
-    private func restorePowerModes() {
-        guard let saved = UserDefaults.standard.dictionary(forKey: savedModesKey) as? [String: String] else { return }
-        if saved.allSatisfy({ sudoPmset([$0.key, "powermode", $0.value]).ok }) {
-            UserDefaults.standard.removeObject(forKey: savedModesKey)
-        }
-    }
-
-    // Reads the per-power-source powermode from `pmset -g custom`, keyed by pmset flag.
-    private func currentPowerModes() -> [String: String] {
-        var modes: [String: String] = [:]
-        var flag: String?
-        for line in run("/usr/bin/pmset", ["-g", "custom"]).output.split(separator: "\n") {
-            if line.hasPrefix("Battery Power") {
-                flag = "-b"
-            } else if line.hasPrefix("AC Power") {
-                flag = "-c"
-            } else if let flag {
-                let parts = line.split(separator: " ")
-                if parts.count == 2, parts[0] == "powermode" { modes[flag] = String(parts[1]) }
-            }
-        }
-        return modes
+    private func setPowerMode(_ mode: PowerMode) {
+        if sudoPmset(["-a", "powermode", mode.rawValue]).ok { appliedMode = mode }
     }
 
     @discardableResult
