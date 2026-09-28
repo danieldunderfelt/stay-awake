@@ -2,8 +2,9 @@ import AppKit
 import IOKit
 
 // Toggles pmset's SleepDisabled flag, which (unlike caffeinate) also blocks
-// clamshell sleep with no external display. While the lid is closed it can also
-// switch to Low Power Mode. Needs the sudoers rule from install.sh.
+// clamshell sleep with no external display. While the lid is closed and no
+// external display is connected it can also switch to Low Power Mode. Needs the
+// sudoers rule from install.sh.
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let toggleItem = NSMenuItem(title: "Stay Awake (even with lid closed)", action: #selector(toggle), keyEquivalent: "")
@@ -32,6 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(updatePowerMode), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         lidTimer = Timer.scheduledTimer(timeInterval: 5, target: self, selector: #selector(updatePowerMode),
                                         userInfo: nil, repeats: true)
         didWake()
@@ -52,6 +55,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defer { IOObjectRelease(root) }
         let state = IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)
         return state?.takeRetainedValue() as? Bool ?? false
+    }
+
+    private var externalDisplayConnected: Bool {
+        var count: UInt32 = 0
+        CGGetOnlineDisplayList(0, nil, &count)
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        CGGetOnlineDisplayList(count, &displays, &count)
+        return displays.prefix(Int(count)).contains { CGDisplayIsBuiltin($0) == 0 }
     }
 
     private func refresh() {
@@ -94,7 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func updatePowerMode() {
         let applied = UserDefaults.standard.dictionary(forKey: savedModesKey) != nil
-        let wantLowPower = lidClosed && UserDefaults.standard.bool(forKey: lowPowerKey) && (applied || sleepDisabled)
+        let wantLowPower = lidClosed && !externalDisplayConnected && UserDefaults.standard.bool(forKey: lowPowerKey) && (applied || sleepDisabled)
         if wantLowPower, !applied {
             let modes = currentPowerModes()
             if sudoPmset(["-a", "powermode", "1"]).ok {
